@@ -677,3 +677,127 @@ class KNNModel(nn.Module):
     
 def set_knn_model(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device, subcluster_type='bipolar'):
     return KNNModel(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device)
+
+class EfficientKNNModel(KNNModel):
+    def __init__(self, ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device, 
+                 use_coreset=False, coreset_size=64, 
+                 use_pca=False, pca_dims=128, 
+                 use_binary=False):
+        super().__init__(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device)
+        
+        self.use_coreset = use_coreset
+        self.coreset_size = coreset_size
+        self.use_pca = use_pca
+        self.pca_dims = pca_dims
+        self.use_binary = use_binary
+        
+        if self.use_pca:
+            # Fixed Random Projection matrix for dimension reduction
+            rp = torch.randn(self.hd_dim, self.pca_dims) / (self.pca_dims ** 0.5)
+            self.register_buffer('rp_matrix', rp)
+            
+    def _farthest_point_sample(self, pts, k):
+        N, D = pts.shape
+        centroids = torch.zeros(k, dtype=torch.long, device=pts.device)
+        distance = torch.ones(N, device=pts.device) * 1e10
+        farthest = torch.randint(0, N, (1,), dtype=torch.long, device=pts.device).item()
+        
+        for i in range(k):
+            centroids[i] = farthest
+            centroid = pts[farthest, :].unsqueeze(0)
+            dist = torch.sum((pts - centroid) ** 2, -1)
+            mask = dist < distance
+            distance[mask] = dist[mask]
+            farthest = torch.argmax(distance, -1).item()
+        return centroids
+
+    def _transform(self, enc):
+        x = enc
+        if self.use_pca:
+            x = x @ self.rp_matrix.to(x.dtype)
+        if self.use_binary:
+            x = torch.sign(x)
+        else:
+            x = F.normalize(x)
+        return x
+
+    def _compute_distance(self, topk_sims, dim):
+        if self.use_binary:
+            # Normalized Hamming distance mapped from dot product
+            return (1.0 - (topk_sims / dim)) / 2.0
+        else:
+            # Cosine distance
+            return 1.0 - topk_sims
+
+    @torch.no_grad()
+    def get_confidence(self, enc, preds=None):
+        if preds is None:
+            preds = self.get_predictions(enc).argmax(dim=1)
+            
+        enc_t = self._transform(enc)
+        dim = enc_t.shape[1]
+        
+        confidence = torch.full((enc_t.shape[0],), -6e4, device=self.device, dtype=enc_t.dtype)
+        
+        for c in preds.unique().tolist():
+            m = preds == c
+            hc = enc_t[m]
+            
+            in_bank = self.bank.get(c, torch.empty(0, device=self.device))
+            out_bank = torch.cat([self.bank[o] for o in self.bank if o != c and self.bank[o].shape[0] > 0], dim=0) if len(self.bank) > 1 else torch.empty(0, device=self.device)
+            
+            if in_bank.shape[0] == 0:
+                continue
+                
+            if out_bank.shape[0] == 0:
+                confidence[m] = 0.0
+                continue
+                
+            k_in = min(self.k, in_bank.shape[0])
+            sims_in = hc @ in_bank.T
+            topk_in = sims_in.topk(k_in, dim=1).values
+            d_in = self._compute_distance(topk_in, dim).clamp_min(0.0).mean(dim=1)
+            
+            k_out = min(self.k, out_bank.shape[0])
+            sims_out = hc @ out_bank.T
+            topk_out = sims_out.topk(k_out, dim=1).values
+            d_out = self._compute_distance(topk_out, dim).clamp_min(0.0).mean(dim=1)
+            
+            confidence[m] = - (d_in / d_out.clamp_min(1e-4))
+            
+        return confidence
+
+    @torch.no_grad()
+    def update_bank(self, enc, labels):
+        enc_t = self._transform(enc)
+        
+        for c in labels.unique().tolist():
+            m = labels == c
+            new_samples = enc_t[m]
+            
+            if c not in self.bank:
+                self.bank[c] = torch.empty((0, enc_t.shape[1]), device=self.device, dtype=enc_t.dtype)
+                
+            if self.bank[c].dtype != enc_t.dtype:
+                self.bank[c] = self.bank[c].to(dtype=enc_t.dtype)
+                
+            self.bank[c] = torch.cat([self.bank[c], new_samples], dim=0)
+            
+            target_size = self.coreset_size if self.use_coreset else self.bank_size
+            if self.bank[c].shape[0] > target_size:
+                if self.use_coreset:
+                    # FPS requires float tensors for L2 distance calculation
+                    b = self.bank[c]
+                    if b.dtype != torch.float32:
+                        b = b.float()
+                    fps_idx = self._farthest_point_sample(b, target_size)
+                    self.bank[c] = self.bank[c][fps_idx]
+                else:
+                    self.bank[c] = self.bank[c][-target_size:]
+
+def set_efficient_knn_model(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device, 
+                            use_coreset=False, coreset_size=64, 
+                            use_pca=False, pca_dims=128, 
+                            use_binary=False):
+    return EfficientKNNModel(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device,
+                             use_coreset, coreset_size, use_pca, pca_dims, use_binary)
