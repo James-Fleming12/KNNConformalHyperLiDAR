@@ -11,8 +11,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from common.laserscan import SemLaserScan, LaserScan
 from dataset.kitti.parser import Parser
-from unsup_main import train_extractor, train_hdc
-from unsup_waymo import extract_metrics_from_conf_matrix, setup_logger, save_graphic, load_hdc_model
+import unsup_main
+from unsup_main import train_extractor, train_hdc, extract_metrics_from_conf_matrix, setup_logger, save_graphic, load_hdc_model
 
 def corrupt_beam(points, severity):
     distances = np.linalg.norm(points[:, :3], axis=1)

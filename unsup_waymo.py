@@ -9,33 +9,9 @@ from tqdm import tqdm
 
 from unsup_ugw import pretrain_pipeline
 from dataset.kitti.parser import Parser
+from unsup_main import setup_logger, save_graphic, extract_metrics_from_conf_matrix, load_hdc_model
 
-def setup_logger(log_file):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    logger = logging.getLogger(log_file)
-    logger.setLevel(logging.INFO)
-    fh = logging.FileHandler(log_file)
-    fh.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    if not logger.handlers:
-        logger.addHandler(fh)
-    return logger
 
-def save_graphic(save_path, title, data):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.figure()
-    if isinstance(data, dict):
-        for label, values in data.items():
-            plt.plot(values, label=label)
-        plt.legend()
-    else:
-        plt.plot(data)
-    plt.title(title)
-    plt.xlabel('Steps')
-    plt.ylabel('Metric')
-    plt.savefig(save_path)
-    plt.close()
 
 def save_improvement_bar_chart(save_path, title, data):
     import numpy as np
@@ -66,23 +42,7 @@ def save_improvement_bar_chart(save_path, title, data):
     plt.savefig(save_path)
     plt.close()
 
-def extract_metrics_from_conf_matrix(conf_matrix):
-    tp = torch.diag(conf_matrix)
-    union = conf_matrix.sum(dim=1) + conf_matrix.sum(dim=0) - tp
-    iou_per_class = tp / (union + 1e-6)
-    
-    # Exclude class 0 (unlabeled/ignore)
-    valid_classes = union > 0 
-    valid_classes[0] = False
-    
-    miou = iou_per_class[valid_classes].mean().item()
-    
-    # Calculate overall accuracy excluding class 0
-    total_correct_valid = tp[1:].sum().item()
-    total_samples_valid = conf_matrix[1:, :].sum().item()
-    overall_acc = total_correct_valid / (total_samples_valid + 1e-6)
-    
-    return miou, overall_acc, iou_per_class.cpu().tolist()
+
 
 def evaluate_and_adapt(model, target_dataloader, device):
     """Helper method executing the forward/eval/adapt cycle."""
@@ -197,23 +157,7 @@ def run_nuscenes(model, logger):
         logger.error(f"Failed to load NuScenes dataset: {e}")
         return {"mIoU": [], "Accuracy": []}
 
-def load_hdc_model(path):
-    print(f"Loading pretrained HDC model from {path}...")
-    from modules.HDC_utils import EllipsoidModel
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ARCH = yaml.safe_load(open("config/arch/senet-2048p.yml", 'r'))
-    import os
-    modeldir = os.path.dirname(path)
-    weights_path = os.path.join(modeldir, "SENet_valid_best")
-    if os.path.exists(weights_path):
-        tmp_dict = torch.load(weights_path, map_location='cpu')
-        NUM_CLASSES = tmp_dict['state_dict']['semantic_output.bias'].shape[0]
-    else:
-        NUM_CLASSES = 13 # Fallback
-    model = EllipsoidModel(ARCH, modeldir, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
-    model.load_state_dict(torch.load(path, map_location=device))
-    model.to(device)
-    return model
+
 
 def load_d3ctta_model(path):
     print(f"Loading pretrained feature extractor for D3CTTA from {path}...")

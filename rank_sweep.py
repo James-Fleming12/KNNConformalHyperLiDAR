@@ -57,15 +57,11 @@ def fit_ellipsoid(Y, d, rank, coverage=COVERAGE):
     R = torch.quantile(score_ellipsoid(Y, mu, V, d), coverage).item()
     return {"mu": mu, "V": V, "R": R, "r": V.shape[1], "d": d}
 
-
 def log_volume(e):
     """log vol(E), up to the constant log(c_d) shared by every set.
     vol = c_d * R^d * det(M)^{1/2}, and log det(M) = r * log(d), since high-variance
     dirs contribute log(d) each and low-variance dirs contribute log(1) = 0."""
     return e["d"] * math.log(max(e["R"], 1e-12)) + 0.5 * e["r"] * math.log(e["d"])
-
-
-# ================================================================== data collection
 
 @torch.no_grad()
 def collect_source(model, loader, device, max_per_class=MAX_PER_CLASS):
@@ -92,15 +88,16 @@ def collect_source(model, loader, device, max_per_class=MAX_PER_CLASS):
             break
     return {c: torch.cat(t) for c, t in buckets.items() if t}
 
-
 @torch.no_grad()
-def collect_target(model, loader, device):
+def collect_target(model, loader, device, max_per_class=MAX_PER_CLASS):
     """(H, preds, correct) for one corrupted stream, using the frozen model."""
     H, P, C = [], [], []
     protos = F.normalize(model.classify.weight)
+    counts = {c: 0 for c in range(model.num_classes)}
     for batch in loader:
         x = batch[0].to(device)
         y = batch[2].to(device).view(-1)
+        if x.shape[1] == 0: continue
         enc, idx, _ = model.encode(x)
         h = F.normalize(enc)
         lab = y[idx] if idx is not None else y
@@ -109,11 +106,29 @@ def collect_target(model, loader, device):
             continue
         h, lab = h[v], lab[v]
         preds = (h.to(protos.dtype) @ protos.T).argmax(dim=1)
-        H.append(h.cpu()); P.append(preds.cpu()); C.append((preds == lab).cpu())
+        
+        for c in lab.unique().tolist():
+            if counts[c] >= max_per_class:
+                continue
+            mask = (lab == c)
+            hc = h[mask]
+            predc = preds[mask]
+            
+            take = min(hc.shape[0], max_per_class - counts[c])
+            H.append(hc[:take].cpu())
+            P.append(predc[:take].cpu())
+            C.append((predc[:take] == c).cpu())
+            counts[c] += take
+            
+        # We can stop if we have collected enough points for all valid classes
+        # Ignoring class 0 (unlabeled) which might not be used
+        if all(counts[c] >= max_per_class for c in range(1, 17)):
+            break
+            
+    if not H:
+        return torch.zeros(0, model.hd_dim), torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.bool)
+        
     return torch.cat(H), torch.cat(P), torch.cat(C)
-
-
-# ============================================================================== main
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -147,8 +162,6 @@ def main():
     d = model.hd_dim
     print("Model loaded successfully.")
 
-    # Confidence sets are fitted on the SOURCE (clean) distribution -- that is the
-    # entire point of a source-calibrated gate.
     print("\nCollecting source (clean) hypervectors...")
     src = collect_source(model, DataLoader(clean_ds, batch_size=1, num_workers=0), device)
     src = {c: v.to(device) for c, v in src.items()}
@@ -189,7 +202,6 @@ def main():
         except Exception as e:
             print(f"  SKIPPED ({type(e).__name__}: {e})")
 
-    # ---------------------------------------------------------------- the sweep
     print("\n" + "=" * 78)
     print(f"{'rank':>5} {'meanAUROC':>10} {'log_vol':>11}   per-corruption AUROC")
     print("=" * 78)
@@ -208,9 +220,7 @@ def main():
                     continue
                 m = Pd == c
                 e = ells[c]
-                # NEGATE: the score is a DISTANCE, but AUROC wants
-                # "higher = more trustworthy". An AUROC < 0.5 after this negation is
-                # a genuine INVERTED signal, not a sign slip.
+
                 s[m] = -score_ellipsoid(Hd[m], e["mu"], e["V"], d)
             correct = C.numpy().astype(int)
             if len(np.unique(correct)) < 2:

@@ -1,20 +1,20 @@
+import os
+import logging
 import numpy as np
 import torch
 import yaml
+import matplotlib.pyplot as plt
 
 from dataset.kitti.parser import Parser
 from modules.HDC_utils import Model, EllipsoidModel
-from modules.trainer import DGLSSTrainer, Trainer
-from modules.Basic_HD import BasicHD, EllipsoidTrainer
-from modules.ioueval import iouEval
-
-from dataset.export_semantickitti import KittiConverter
+from modules.trainer import Trainer
+from modules.Basic_HD import EllipsoidTrainer
 
 MODEL_DIR = "logs"
 NU_DATA_DIR = "/mnt/alpha/jmfleming/HyperLidar_dataset/nuscenes_all"
 DATA_DIR = "/mnt/alpha/jmfleming/nuscenes_kitti"
 LOG_DIR = "logs"
-NUM_CLASSES = 17 # the arch config has a learning_map that maps the 32 classes to 17 (???)
+NUM_CLASSES = 17 
 
 MAX_HDC_EPOCHS = 10
 FEATURE_EXTRACTOR_EPOCHS = 80
@@ -24,17 +24,69 @@ HD_DIM = 10000
 HDC_SAVE_PATH = "logs/hdc.pth"
 HDC_SUB_PATH = "logs/hdc_sub.pth"
 
-def convert_dataset():
-    converter = KittiConverter(
-        nusc_dir=NU_DATA_DIR,
-        nusc_skitti_dir=DATA_DIR,
-        lidar_name='LIDAR_TOP',
-        nusc_version='v1.0-trainval'
-    )
+def setup_logger(log_file):
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    logger = logging.getLogger(log_file)
+    logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    if not logger.handlers:
+        logger.addHandler(fh)
+    return logger
 
-    converter.nuscenes_gt_to_semantickitti()
+def save_graphic(save_path, title, data):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.figure()
+    if isinstance(data, dict):
+        for label, values in data.items():
+            plt.plot(values, label=label)
+        plt.legend()
+    else:
+        plt.plot(data)
+    plt.title(title)
+    plt.xlabel('Steps')
+    plt.ylabel('Metric')
+    plt.savefig(save_path)
+    plt.close()
 
-    print("Conversion Complete: Output Saved to ")
+def extract_metrics_from_conf_matrix(conf_matrix):
+    tp = torch.diag(conf_matrix)
+    union = conf_matrix.sum(dim=1) + conf_matrix.sum(dim=0) - tp
+    iou_per_class = tp / (union + 1e-6)
+    
+    # Exclude class 0 (unlabeled/ignore)
+    valid_classes = union > 0 
+    valid_classes[0] = False
+    
+    miou = iou_per_class[valid_classes].mean().item()
+    
+    # Calculate overall accuracy excluding class 0
+    total_correct_valid = tp[1:].sum().item()
+    total_samples_valid = conf_matrix[1:, :].sum().item()
+    overall_acc = total_correct_valid / (total_samples_valid + 1e-6)
+    
+    return miou, overall_acc, iou_per_class.cpu().tolist()
+
+def load_hdc_model(path):
+    print(f"Loading pretrained HDC model from {path}...")
+    from modules.HDC_utils import EllipsoidModel
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ARCH = yaml.safe_load(open("config/arch/senet-2048p.yml", 'r'))
+    import os
+    modeldir = os.path.dirname(path)
+    weights_path = os.path.join(modeldir, "SENet_valid_best")
+    if os.path.exists(weights_path):
+        tmp_dict = torch.load(weights_path, map_location='cpu')
+        NUM_CLASSES = tmp_dict['state_dict']['semantic_output.bias'].shape[0]
+    else:
+        NUM_CLASSES = 13 # Fallback
+    model = EllipsoidModel(ARCH, modeldir, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
+    model.load_state_dict(torch.load(path, map_location=device))
+    model.to(device)
+    return model
+
 
 def train_extractor(ARCH, DATA, epochs=FEATURE_EXTRACTOR_EPOCHS, data_dir=None, return_trainer=False, resume_path=None):
     trainer = Trainer(ARCH, DATA, data_dir if data_dir else DATA_DIR, LOG_DIR, path=resume_path) # saves in "/logs/SENet_..."
@@ -42,10 +94,6 @@ def train_extractor(ARCH, DATA, epochs=FEATURE_EXTRACTOR_EPOCHS, data_dir=None, 
 
     if return_trainer:
         return trainer
-
-def train_dglss(ARCH, DATA, dist_type="standard", epochs=FEATURE_EXTRACTOR_EPOCHS):
-    trainer = DGLSSTrainer(ARCH, DATA, DATA_DIR, LOG_DIR, dist_type=dist_type) # saves in "/logs/SENet_..."
-    trainer.train(epochs=epochs)
 
 def train_hdc(ARCH, DATA, epochs=MAX_HDC_EPOCHS, data_dir=None, return_extractor=False) -> EllipsoidModel:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -108,15 +156,6 @@ def test_hdc_model(model, dataloader, return_detailed=False) -> None:
             proj_in = batch_data[0].to(device)
             proj_labels = batch_data[2].to(device)
             logits, _, indices, _ = model(proj_in, PERCENTAGE=None, is_wrong=None)
-
-            # top_two = torch.topk(logits, k=2, dim=1).values
-            # margin = top_two[:, 0] - top_two[:, 1]
-            # print(f"Mean Confidence Margin: {margin.mean().item()}")
-
-            # mask = torch.ones_like(logits, dtype=torch.bool)
-            # mask.scatter_(1, logits.argmax(1, keepdim=True), False)
-            # rcv = logits[mask].view(logits.size(0), -1).var(dim=1)
-            # print(f"Residual Class Variance: {rcv.mean().item()}")
             
             predictions = torch.argmax(logits, dim=1)
             proj_labels_flat = proj_labels.view(-1)
@@ -198,216 +237,3 @@ def test_hdc_model(model, dataloader, return_detailed=False) -> None:
         return global_accuracy, miou, detailed_stats
 
     return global_accuracy, miou
-
-def test_hdc_model_debug(model, dataloader):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    class_correct = torch.zeros(model.num_classes, device=device)
-    class_total = torch.zeros(model.num_classes, device=device)
-    class_sim_sum = torch.zeros(model.num_classes, device=device)
-    class_sim_sq = torch.zeros(model.num_classes, device=device)
-
-    pred_hist = torch.zeros(model.num_classes, device=device)
-
-    global_correct = 0
-    global_total = 0
-
-    model.eval()
-    with torch.no_grad():
-        for proj_in, _, proj_labels, *_ in dataloader:
-            proj_in = proj_in.to(device)
-            proj_labels = proj_labels.to(device).view(-1)
-
-            logits, sims, indices, _ = model(proj_in)
-            predictions = torch.argmax(logits, dim=1)
-
-            selected_labels = proj_labels[indices]
-
-            global_correct += (predictions == selected_labels).sum().item()
-            global_total += selected_labels.numel()
-
-            for c in range(model.num_classes):
-                mask = selected_labels == c
-                if mask.any():
-                    class_total[c] += mask.sum().item()
-                    class_correct[c] += (predictions[mask] == c).sum().item()
-
-                    s = sims[mask]
-                    class_sim_sum[c] += s.sum().item()
-                    class_sim_sq[c] += (s ** 2).sum().item()
-
-            for p in predictions:
-                pred_hist[p] += 1
-
-    print("\n[Accuracy + Similarity Diagnostics]")
-    for c in range(model.num_classes):
-        if class_total[c] > 0:
-            acc = class_correct[c] / class_total[c]
-            mean_sim = class_sim_sum[c] / class_total[c]
-            var_sim = (
-                class_sim_sq[c] / class_total[c] - mean_sim ** 2
-            ).clamp(min=0)
-            std_sim = torch.sqrt(var_sim)
-
-            collapse_flag = "⚠ COLLAPSE" if abs(mean_sim.item() - 0.5) < 1e-3 else ""
-
-            print(
-                f"  Class {c:2d}: acc={acc:.4f}, "
-                f"sim μ={mean_sim:.4f}, σ={std_sim:.4f} {collapse_flag}"
-            )
-        else:
-            print(f"  Class {c:2d}: no samples")
-
-    # Prediction entropy (global collapse detector)
-    pred_dist = pred_hist / pred_hist.sum().clamp(min=1)
-    entropy = -(pred_dist * torch.log2(pred_dist + 1e-8)).sum()
-
-    print("\n[Prediction Entropy]")
-    print(f"  Entropy: {entropy:.4f} (max = log2({model.num_classes}) ≈ {np.log2(model.num_classes):.2f})")
-
-    print("\n[Prediction Distribution]")
-    for c in range(model.num_classes):
-        print(
-            f"  Class {c:2d}: {int(pred_hist[c].item()):6d} "
-            f"({100 * pred_dist[c].item():5.2f}%)"
-        )
-
-    print(
-        f"\nGlobal Accuracy: {global_correct / max(global_total,1):.4f} "
-        f"({global_correct}/{global_total})"
-    )
-
-def test_orig(ARCH, DATA) -> Model:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    parser = Parser(root=DATA_DIR,
-                    train_sequences=DATA["split"]["train"],
-                    valid_sequences=DATA["split"]["valid"],
-                    test_sequences=None,
-                    labels=DATA["labels"],
-                    color_map=DATA["color_map"],
-                    learning_map=DATA["learning_map"],
-                    learning_map_inv=DATA["learning_map_inv"],
-                    sensor=ARCH["dataset"]["sensor"],
-                    max_points=ARCH["dataset"]["max_points"],
-                    batch_size=ARCH["train"]["batch_size"],
-                    workers=ARCH["train"]["workers"],
-                    gt=True,
-                    shuffle_train=True)
-    
-    dataloader = parser.get_train_set()
-    val_loader = parser.get_valid_set()
-
-    ignore = []
-    for cl, ign in DATA['learning_ignore'].items():
-        if ign:
-            x_cl = int(cl)
-            ignore.append(x_cl)
-
-    evaluator = iouEval(NUM_CLASSES, device, ignore)
-
-    trainer = BasicHD(ARCH, DATA, DATA_DIR, LOG_DIR, MODEL_DIR, None)
-
-    trainer.train(dataloader, trainer.model, None)
-
-    for i in range(1):
-        trainer.retrain(dataloader, trainer.model, i+1, None)
-
-    model: Model = trainer.model
-
-    test_hdc_model(model, dataloader)
-
-    # trainer.validate(val_loader, model, evaluator)
-
-    return model
-
-def init_sub(ARCH, DATA):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    parser = Parser(root=DATA_DIR,
-                        train_sequences=DATA["split"]["train"], # self.DATA["split"]["valid"] + self.DATA["split"]["train"] if finetune with valid
-                        valid_sequences=DATA["split"]["valid"],
-                        test_sequences=None,
-                        labels=DATA["labels"],
-                        color_map=DATA["color_map"],
-                        learning_map=DATA["learning_map"],
-                        learning_map_inv=DATA["learning_map_inv"],
-                        sensor=ARCH["dataset"]["sensor"],
-                        max_points=ARCH["dataset"]["max_points"],
-                        batch_size=ARCH["train"]["batch_size"],
-                        workers=ARCH["train"]["workers"],
-                        gt=True,
-                        shuffle_train=True)
-    
-    dataloader = parser.get_train_set()
-
-    model: EllipsoidModel = EllipsoidModel(ARCH, MODEL_DIR, 'rp', 0, 0, NUM_CLASSES, device)
-    model = torch.load(HDC_SAVE_PATH, weights_only=False)
-
-    model.init_subclusters(dataloader)
-    test_hdc_model(model, dataloader)
-
-    torch.save(model.state_dict(), HDC_SUB_PATH)
-
-    print(f"Subcluster Initialized Model saved to {HDC_SUB_PATH}")
-
-def test_inference(ARCH, DATA):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    parser = Parser(root=DATA_DIR,
-                        train_sequences=DATA["split"]["train"], # self.DATA["split"]["valid"] + self.DATA["split"]["train"] if finetune with valid
-                        valid_sequences=DATA["split"]["valid"],
-                        test_sequences=None,
-                        labels=DATA["labels"],
-                        color_map=DATA["color_map"],
-                        learning_map=DATA["learning_map"],
-                        learning_map_inv=DATA["learning_map_inv"],
-                        sensor=ARCH["dataset"]["sensor"],
-                        max_points=ARCH["dataset"]["max_points"],
-                        batch_size=ARCH["train"]["batch_size"],
-                        workers=ARCH["train"]["workers"],
-                        gt=True,
-                        shuffle_train=True)
-    
-    dataloader = parser.get_train_set()
-
-    model: EllipsoidModel = EllipsoidModel(ARCH, MODEL_DIR, 'rp', 0, 0, NUM_CLASSES, device)
-    model.load_state_dict(torch.load(HDC_SUB_PATH, weights_only=False))
-    model.to(device)
-
-    images, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = next(iter(dataloader))
-
-    image = images[0].to(device).unsqueeze(0)
-
-    model.inference_update(image)
-
-def main():
-    try:
-        # ARCH = yaml.safe_load(open("config/arch/senet-1024p.yml", 'r'))
-        ARCH = yaml.safe_load(open("config/arch/senet-2048p-gen.yml", 'r')) # higher res
-    except Exception as e:
-        print(f"Error opening arch yaml file. {e}")
-        quit()
-    try:
-        DATA = yaml.safe_load(open("config/labels/nuscenes_new.yaml", 'r'))
-    except Exception as e:
-        print(f"Error opening data yaml file. {e}")
-        quit()
-
-    # convert_dataset()
-
-    ARCH["train"]["batch_size"] = 16
-
-    train_extractor(ARCH, DATA)
-    # DDFEtrain_extractor(ARCH, DATA)
-
-    ARCH["train"]["batch_size"] = 2
-
-    hdc = train_hdc(ARCH, DATA)
-    init_sub(ARCH, DATA)
-    # test_inference(ARCH, DATA)
-
-    # test_orig(ARCH, DATA)
-
-if __name__=="__main__":
-    main()

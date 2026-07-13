@@ -12,8 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from dataset.kitti.parser import Parser
 import unsup_main
-from unsup_main import train_extractor, train_hdc
-from unsup_waymo import extract_metrics_from_conf_matrix, setup_logger, save_graphic
+from unsup_main import train_extractor, train_hdc, extract_metrics_from_conf_matrix, setup_logger, save_graphic
 from modules.HDC_utils import EllipsoidModel
 from modules.aug_model import AugModel
 
