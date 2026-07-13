@@ -199,7 +199,7 @@ def run_nuscenes(model, logger):
 
 def load_hdc_model(path):
     print(f"Loading pretrained HDC model from {path}...")
-    from modules.HDC_utils import DensityModel
+    from modules.HDC_utils import EllipsoidModel
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ARCH = yaml.safe_load(open("config/arch/senet-2048p.yml", 'r'))
     import os
@@ -210,7 +210,7 @@ def load_hdc_model(path):
         NUM_CLASSES = tmp_dict['state_dict']['semantic_output.bias'].shape[0]
     else:
         NUM_CLASSES = 13 # Fallback
-    model = DensityModel(ARCH, modeldir, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
+    model = EllipsoidModel(ARCH, modeldir, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
     model.load_state_dict(torch.load(path, map_location=device))
     model.to(device)
     return model

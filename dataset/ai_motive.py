@@ -183,9 +183,9 @@ def _parser_collate(batch):
 
     return proj_in, None, proj_labels, None, None, None, None, None, None, None, None, None, None, None, None
 
-class AiMotiveDensityTrainer:
+class AiMotiveEllipsoidTrainer:
     """
-    Minimal stand-in for DensityTrainer that works with aiMotive DataLoaders.
+    Minimal stand-in for EllipsoidTrainer that works with aiMotive DataLoaders.
     Avoids the KITTI Parser entirely while reusing the HDC train/retrain logic.
     """
     def __init__(self, model: EllipsoidModel, num_classes: int, device: torch.device, bipolar_prototypes: bool = False):

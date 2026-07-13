@@ -7,7 +7,7 @@ import yaml
 import matplotlib.pyplot as plt
 
 from dataset.kitti.parser import Parser
-from modules.HDC_utils import Model, DensityModel
+from modules.HDC_utils import Model, EllipsoidModel
 
 from tqdm import tqdm
 
@@ -220,7 +220,7 @@ def incremental_update_test(ARCH, DATA, pretrained_path="logs/hdc_sub.pth", comp
         if compare:
             model_base = load_d3ctta_model(pretrained_path)
         else:
-            model_base = DensityModel(ARCH, MODEL_DIR, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
+            model_base = EllipsoidModel(ARCH, MODEL_DIR, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
             model_base.load_state_dict(torch.load(pretrained_path, map_location=device))
             model_base.to(device)
         acc_sunny, miou_sunny = test_hdc_model(model_base, val_loaders["sunny"])
@@ -242,7 +242,7 @@ def incremental_update_test(ARCH, DATA, pretrained_path="logs/hdc_sub.pth", comp
                 # D3CTTA does not support online subclusters logic easily, so we just use inference_update
                 update_fn = model.inference_update
             else:
-                model = DensityModel(ARCH, MODEL_DIR, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
+                model = EllipsoidModel(ARCH, MODEL_DIR, 'rp', 0, 0, NUM_CLASSES, device, subcluster_type='continuous')
                 model.load_state_dict(torch.load(pretrained_path, map_location=device))
                 model.to(device)
                 update_fn = model.inference_update_with_subcluster_pull if cfg["online_subclusters"] else model.inference_update
