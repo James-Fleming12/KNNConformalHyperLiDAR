@@ -91,7 +91,7 @@ def knn_dists(H, bank, k, chunk=CHUNK):
     order-equivalent to kNN-Euclidean. Chunked to keep the |H| x |bank| matrix off
     the GPU all at once.
     """
-    out = torch.empty(H.shape[0], device=H.device)
+    out = torch.empty(H.shape[0], device=H.device, dtype=H.dtype)
     kk = min(k, bank.shape[0])
     for i in range(0, H.shape[0], chunk):
         h = H[i:i + chunk]
@@ -257,7 +257,7 @@ def main():
         row = {}
         for cond, (H, P, C, M) in tgt.items():
             if arm == "ball":
-                s = torch.full((H.shape[0],), -1e9, device=device)
+                s = torch.full((H.shape[0],), -1e9, device=device, dtype=H.dtype)
                 for c in P.unique().tolist():
                     if c not in valid:
                         continue
@@ -284,8 +284,8 @@ def main():
     for k in KS:
         row_in, row_ratio = {}, {}
         for cond, (H, P, C, M) in tgt.items():
-            s_in = torch.full((H.shape[0],), 1e9, device=device)
-            s_ratio = torch.full((H.shape[0],), 1e9, device=device)
+            s_in = torch.full((H.shape[0],), 1e9, device=device, dtype=H.dtype)
+            s_ratio = torch.full((H.shape[0],), 1e9, device=device, dtype=H.dtype)
             for c in P.unique().tolist():
                 if c not in valid:
                     continue
