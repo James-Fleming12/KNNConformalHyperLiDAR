@@ -406,6 +406,8 @@ def main():
         'Accuracy': {m: {c: {} for c in CORRUPTIONS} for m in methods_to_run},
     }
     
+    shared_init_metrics = {}
+    
     # Load dataset once and partition it to find chunks
     # Note on Protocol: D3CTTA divides the valid set into 7 disjoint chunks (1 per corruption).
     # This evaluates each corruption on 1/7 of the validation set (e.g., ~581 frames) instead 
@@ -525,8 +527,13 @@ def main():
             try:
                 if not args.chunked or args.reset_per_corruption:
                     # Pass 1: True Initial (Frozen on chunk)
-                    logger.info("  -> Pass 1: Computing True Initial metrics (Frozen)")
-                    init_metrics = evaluate_and_adapt(model, target_dataloader, device, eval_only=True, dry_run=args.dry_run)
+                    if (ctype, sev) not in shared_init_metrics:
+                        logger.info("  -> Pass 1: Computing True Initial metrics (Frozen)")
+                        init_metrics = evaluate_and_adapt(model, target_dataloader, device, eval_only=True, dry_run=args.dry_run)
+                        shared_init_metrics[(ctype, sev)] = init_metrics
+                    else:
+                        logger.info("  -> Pass 1: Reusing cached True Initial metrics (Frozen)")
+                        init_metrics = shared_init_metrics[(ctype, sev)]
                     
                     # Pass 2: Adapt (only if method is not frozen)
                     if current_method != 'frozen':
