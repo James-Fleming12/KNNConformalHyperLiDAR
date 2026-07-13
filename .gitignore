@@ -6,7 +6,6 @@ logs/*
 common/*
 *.pyc
 /logs/*
-*.txt
 *.png
 thirdparty
 *.pdf
