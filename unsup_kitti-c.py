@@ -196,6 +196,34 @@ def evaluate_and_adapt(model, target_dataloader, device, eval_only=False, update
                         use_anchor=True,
                         proj_xyz=proj_xyz
                     )
+                elif update_method == 'knn':
+                    model.online_update(
+                        proj_in,
+                        learning_rate=0.01,
+                        threshold=-1.2 # Contrastive gate for k-NN
+                    )
+                elif update_method == 'prototype':
+                    # Baseline prototype gating: reuse online_update but hack the confidence to be prototype cosine similarity
+                    # To do this cleanly, we will pass a high threshold and just rely on the fallback or we can implement a custom update_fn.
+                    # Since we want to use EMA style but with prototype gating, let's implement a tiny custom update inline.
+                    enc, _, _ = model.encode(proj_in)
+                    original_x = proj_in.permute(0, 2, 3, 1).contiguous().reshape(-1, proj_in.shape[1])
+                    valid_mask = torch.any(original_x != 0, dim=1)
+                    if torch.any(valid_mask):
+                        active_enc = torch.nn.functional.normalize(enc[valid_mask])
+                        logits = model.classify(active_enc)
+                        preds = torch.argmax(logits, dim=1)
+                        sims = logits.max(dim=1).values
+                        valid_updates = sims > 0.45 # standard prototype margin
+                        for c in preds[valid_updates].unique():
+                            c_mask = (preds == c) & valid_updates
+                            if not c_mask.any(): continue
+                            weights = sims[c_mask] / sims[c_mask].sum()
+                            pull_vec = (active_enc[c_mask] * weights.unsqueeze(1)).sum(dim=0)
+                            model.proto_momentum[c] = 0.9 * model.proto_momentum[c] + 0.1 * pull_vec
+                            eff_lr = 0.01 * sims[c_mask].mean().item()
+                            upd = (1.0 - eff_lr) * model.classify.weight[c] + eff_lr * model.proto_momentum[c]
+                            model.classify.weight[c] = torch.nn.functional.normalize(upd.unsqueeze(0), dim=1).squeeze(0)
     
     avg_firing_rate = 0.0
     if hasattr(model, '_firing_log') and len(model._firing_log) > 0:
@@ -279,6 +307,57 @@ def load_hdc_model(path, num_classes=NUM_CLASSES):
     model.to(device)
     return model
 
+def populate_knn_bank(model, data_dir, arch_cfg, data_cfg, device):
+    bank_path = os.path.join(os.path.dirname(data_dir), "knn_bank.pt")
+    if os.path.exists(bank_path):
+        print(f"Loading pre-populated k-NN bank from {bank_path}...")
+        bank_data = torch.load(bank_path, map_location=device)
+        model.bank = bank_data
+        return
+
+    print(f"Populating k-NN bank from {data_dir}...")
+    parser = Parser(root=data_dir,
+                    train_sequences=data_cfg["split"]["train"],
+                    valid_sequences=data_cfg["split"]["valid"],
+                    test_sequences=None,
+                    labels=data_cfg["labels"],
+                    color_map=data_cfg.get("color_map", {}),
+                    learning_map=data_cfg["learning_map"],
+                    learning_map_inv=data_cfg["learning_map_inv"],
+                    sensor=arch_cfg["dataset"]["sensor"],
+                    max_points=arch_cfg["dataset"]["max_points"],
+                    batch_size=1,
+                    workers=arch_cfg["train"]["workers"],
+                    gt=True,
+                    shuffle_train=True) 
+    
+    dataloader = DataLoader(parser.trainloader.dataset, batch_size=1, shuffle=True, num_workers=4)
+    model.eval()
+    
+    with torch.no_grad():
+        for batch_data in tqdm(dataloader, desc="Populating Bank"):
+            proj_in = batch_data[0].to(device)
+            proj_labels = batch_data[2].to(device).view(-1)
+            
+            if proj_in.shape[1] > 0:
+                enc, _, _ = model.encode(proj_in)
+                original_x = proj_in.permute(0, 2, 3, 1).contiguous().reshape(-1, proj_in.shape[1])
+                valid_mask = torch.any(original_x != 0, dim=1)
+                
+                if not torch.any(valid_mask):
+                    continue
+                    
+                enc = enc[valid_mask]
+                labels = proj_labels[valid_mask]
+                
+                model.update_bank(enc, labels)
+                
+                if all(model.bank[c].shape[0] >= model.bank_size for c in range(model.num_classes)):
+                    break
+                    
+    print(f"Saving populated bank to {bank_path}...")
+    torch.save(model.bank, bank_path)
+
 def main():
     parser = argparse.ArgumentParser(description="Test Unsupervised Updates on KITTI-C")
     parser.add_argument('--pretrain', action='store_true', help='Run pretraining on SemanticKITTI before evaluating')
@@ -287,7 +366,7 @@ def main():
     parser.add_argument('--skip_extractor', action='store_true', help='Skip feature extractor pretraining and only retrain the HDC model')
     parser.add_argument('--pretrained_path', type=str, default='logs/kitti_pretrain/hdc_sub.pth', help='Path to load pretrained model')
     parser.add_argument('--log_dir', type=str, default='logs/kitti_c_test', help='Directory to save logs and graphics')
-    parser.add_argument('--method', type=str, choices=['frozen', 'density', 'exp_a', 'exp_a_single', 'exp_a_anchor_off', 'exp_a_anchor_on', 'exp_a_safe', 'exp_a_v2', 'exp_a_v3', 'exp_a_v4', 'exp_density_hybrid', 'all'], default='density', help='Method to test.')
+    parser.add_argument('--method', type=str, choices=['frozen', 'density', 'knn', 'prototype', 'exp_a', 'exp_a_single', 'exp_a_anchor_off', 'exp_a_anchor_on', 'exp_a_safe', 'exp_a_v2', 'exp_a_v3', 'exp_a_v4', 'exp_density_hybrid', 'all'], default='knn', help='Method to test.')
     parser.add_argument('--dry_run', action='store_true', help='Run only 2 batches per condition to quickly verify no crashes will occur.')
     parser.add_argument('--continue_pretrain', action='store_true', help='Resume pretraining from the existing pretrained_path')
     parser.add_argument('--continue', dest='continue_epochs', type=int, default=0, help='Continue feature extractor training for this many epochs, reinitialize HDC, and perform adaptation')
@@ -336,7 +415,7 @@ def main():
             logger.info(f"Successfully pretrained model on SemanticKITTI. Optimizer state saved to {opt_path}")
             
     sev = args.severity
-    methods_to_run = ['density', 'exp_density_hybrid', 'exp_a', 'exp_a_v2'] if args.method == 'all' else [args.method]
+    methods_to_run = ['frozen', 'prototype', 'knn'] if args.method == 'all' else [args.method]
     
     global_results = {
         'mIoU': {m: {c: {} for c in CORRUPTIONS} for m in methods_to_run},
@@ -389,11 +468,17 @@ def main():
         results_acc = {c: {} for c in active_corruptions}
 
         model = load_hdc_model(args.pretrained_path, num_classes=NUM_CLASSES)
+        if current_method == 'knn':
+            populate_knn_bank(model, args.kitti_dir, ARCH, DATA, device)
+            # Make a clean backup of the bank to restore on reset
+            clean_bank = {k: v.clone() for k, v in model.bank.items()}
 
         for i, ctype in enumerate(active_corruptions):
             if args.reset_per_corruption and not args.standard:
                 logger.info("Resetting model to clean pretrained weights for this corruption.")
                 model = load_hdc_model(args.pretrained_path, num_classes=NUM_CLASSES)
+                if current_method == 'knn':
+                    model.bank = {k: v.clone() for k, v in clean_bank.items()}
                 
             logger.info(f"Testing {ctype} severity {sev} (Chunk {i+1}/{len(active_corruptions)})")
             

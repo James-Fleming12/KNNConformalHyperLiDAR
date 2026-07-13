@@ -372,6 +372,11 @@ class KNNModel(nn.Module):
 
         self.register_buffer('proto_momentum', torch.zeros_like(self.classify.weight.data)) # EMA momentum
 
+        # KNN Confidence Bank
+        self.k = 100
+        self.bank_size = 3000
+        self.bank = {c: torch.empty((0, self.hd_dim), device=self.device) for c in range(self.num_classes)}
+
     def encode(self, x, mask=None, PERCENTAGE=None, is_wrong=None, chunk_idx=None):
         if mask is None:
             mask = torch.ones(self.hd_dim, device=self.device).type(torch.bool)
@@ -469,8 +474,148 @@ class KNNModel(nn.Module):
             pair_simil[:self.num_classes, :self.num_classes] = torch.eye(self.num_classes)
         return pair_simil.detach().cpu().numpy(), class_hv.detach().cpu().numpy()
     
-    def online_update(self, x):
-        pass
+    @torch.no_grad()
+    def get_confidence(self, enc, preds=None):
+        """
+        Returns the k-NN contrastive confidence (higher = more trustworthy).
+        Score is the negative ratio of in-class distance to out-of-class distance.
+        """
+        if preds is None:
+            preds = self.get_predictions(enc).argmax(dim=1)
+            
+        enc = F.normalize(enc)
+        # We want higher confidence to be better. So we compute - (d_in / d_out)
+        # Initialize with -6e4 (a low valid float16 confidence)
+        confidence = torch.full((enc.shape[0],), -6e4, device=self.device, dtype=enc.dtype)
+        
+        for c in preds.unique().tolist():
+            m = preds == c
+            hc = enc[m]
+            
+            in_bank = self.bank.get(c, torch.empty(0, device=self.device))
+            out_bank = torch.cat([self.bank[o] for o in self.bank if o != c and self.bank[o].shape[0] > 0], dim=0) if len(self.bank) > 1 else torch.empty(0, device=self.device)
+            
+            if in_bank.shape[0] == 0:
+                # If no samples in the bank for this class, we can't trust it.
+                continue
+                
+            if out_bank.shape[0] == 0:
+                # If no out-of-class samples exist, we have perfect confidence
+                confidence[m] = 0.0
+                continue
+                
+            # Compute d_in (distance to nearest neighbors within predicted class)
+            k_in = min(self.k, in_bank.shape[0])
+            sims_in = hc @ in_bank.T
+            topk_in = sims_in.topk(k_in, dim=1).values
+            d_in = (1.0 - topk_in).clamp_min(0.0).mean(dim=1)
+            
+            # Compute d_out (distance to nearest neighbors across all other classes)
+            k_out = min(self.k, out_bank.shape[0])
+            sims_out = hc @ out_bank.T
+            topk_out = sims_out.topk(k_out, dim=1).values
+            d_out = (1.0 - topk_out).clamp_min(0.0).mean(dim=1)
+            
+            # Ratio (lower ratio = more trustworthy) -> negate for confidence
+            confidence[m] = - (d_in / d_out.clamp_min(1e-4))
+            
+        return confidence
+
+    @torch.no_grad()
+    def update_bank(self, enc, labels):
+        """
+        Add newly admitted, highly confident samples to the k-NN bank.
+        Uses a FIFO queue to enforce `self.bank_size`.
+        """
+        enc = F.normalize(enc)
+        for c in labels.unique().tolist():
+            m = labels == c
+            new_samples = enc[m]
+            
+            if c not in self.bank:
+                self.bank[c] = torch.empty((0, self.hd_dim), device=self.device, dtype=enc.dtype)
+                
+            # If the dtypes don't match (e.g. from float32 initial empty buffer), cast the bank
+            if self.bank[c].dtype != enc.dtype:
+                self.bank[c] = self.bank[c].to(dtype=enc.dtype)
+                
+            self.bank[c] = torch.cat([self.bank[c], new_samples], dim=0)
+            
+            # Truncate to retain only the most recent samples
+            if self.bank[c].shape[0] > self.bank_size:
+                self.bank[c] = self.bank[c][-self.bank_size:]
+                
+    @torch.no_grad()
+    def online_update(self, x, learning_rate=0.01, threshold=-1.0):
+        """
+        Takes an input batch x (cenet image), encodes it, computes k-NN confidence,
+        and uses the highly confident samples to update the class prototypes 
+        (self.classify.weight) via EMA style updates.
+        """
+        self.eval()
+        enc, _, _ = self.encode(x)
+        num_total_samples = enc.shape[0]
+
+        original_x = x.permute(0, 2, 3, 1).contiguous().reshape(-1, x.shape[1])
+        valid_enc_mask = torch.any(original_x != 0, dim=1) # ignore background
+        
+        if not torch.any(valid_enc_mask):
+            return torch.zeros(num_total_samples, device=self.device, dtype=torch.long)
+        
+        active_enc = enc[valid_enc_mask]
+        enc_norm = F.normalize(active_enc)
+        
+        if enc_norm.dtype != self.classify.weight.dtype:
+            enc_norm = enc_norm.to(self.classify.weight.dtype)
+
+        logits = self.classify(enc_norm)
+        predictions = torch.argmax(logits, dim=1)
+        
+        full_predictions = torch.zeros(num_total_samples, device=self.device, dtype=torch.long)
+        full_predictions[valid_enc_mask] = predictions
+
+        # Compute k-NN confidence (negated ratio of d_in / d_out. Higher is better)
+        confidences = self.get_confidence(enc_norm, predictions)
+        
+        # Filter based on confidence threshold
+        valid_mask = confidences > threshold
+        
+        if not torch.any(valid_mask):
+            return full_predictions
+
+        valid_indices = torch.nonzero(valid_mask).squeeze(1)
+        unique_classes = torch.unique(predictions[valid_indices])
+
+        for class_id in unique_classes:
+            c_id = class_id.item()
+
+            class_mask = (predictions == c_id) & valid_mask
+            if not torch.any(class_mask):
+                continue
+                
+            class_indices = torch.nonzero(class_mask).squeeze(1)
+            sample_encs = enc_norm[class_indices]
+            class_confs = confidences[class_indices]
+
+            # Shift confidences to positive weights using exp() since they are negative ratios
+            weights = torch.exp(class_confs)
+            weights = weights / weights.sum()
+            
+            weighted_pull_vector = (sample_encs * weights.unsqueeze(1)).sum(dim=0)
+            
+            # effective_lr scaled by average confidence multiplier
+            effective_lr = learning_rate * torch.exp(class_confs.mean()).item()
+
+            current_weight = self.classify.weight[c_id]
+            
+            # EMA Momentum Update
+            self.proto_momentum[c_id] = 0.9 * self.proto_momentum[c_id] + 0.1 * weighted_pull_vector
+            updated_weight = (1.0 - effective_lr) * current_weight + effective_lr * self.proto_momentum[c_id]
+            
+            updated_weight_norm = F.normalize(updated_weight.unsqueeze(0), dim=1).squeeze(0)
+            self.classify.weight[c_id] = updated_weight_norm
+
+        return full_predictions
     
 def set_knn_model(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device, subcluster_type='bipolar'):
     return KNNModel(ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device)
