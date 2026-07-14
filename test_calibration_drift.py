@@ -29,6 +29,26 @@ N_FRAMES = 300
 OUT = "calibration_drift.json"
 
 
+# ------------------------------------------------------------------ metrics
+
+def fast_hist(preds, labels, num_classes):
+    mask = (labels >= 0) & (labels < num_classes)
+    hist = torch.bincount(
+        num_classes * labels[mask].long() + preds[mask].long(),
+        minlength=num_classes ** 2,
+    ).reshape(num_classes, num_classes)
+    return hist
+
+def calculate_iou(hist):
+    eps = 1e-10
+    tp = torch.diag(hist)
+    fp = hist.sum(dim=0) - tp
+    fn = hist.sum(dim=1) - tp
+    iou = tp / (tp + fp + fn + eps)
+    valid_classes = (hist.sum(dim=1) + hist.sum(dim=0)) > 0
+    miou = iou[valid_classes].mean().item()
+    return miou * 100
+
 # ------------------------------------------------------------------ the gates
 
 class StaticGate:
@@ -84,9 +104,8 @@ class ACISetSizeGate:
 class ACIOracleGate:
     """UPPER BOUND ONLY -- uses ground-truth miscoverage. NOT DEPLOYABLE.
 
-    This is standard ACI (Gibbs & Candes). It exists in this experiment purely to show
-    the ceiling that the label-free surrogate is chasing. If aci_setsize lands close to
-    aci_oracle, the surrogate is a good one. Never report this as a method.
+    This uses precision-based miscoverage (among admitted points) to simulate
+    a true oracle guiding the gating.
     """
     def __init__(self, q0, alpha=1.0 - TARGET_COVERAGE, gamma=GAMMA):
         self.q = q0
@@ -167,8 +186,40 @@ def run_arm(model, loader, device, arm, gate, src_proto, n_frames=N_FRAMES):
         if arm not in ("ungated",):
             gate.update(sims, preds, correct)
 
+    # --- FINAL EVAL PASS ---
+    # Evaluate adapted prototypes over 100 validation frames
+    print(f"      [Evaluating final mIoU for {arm} on 100 frames...]")
+    hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=device)
+    eval_frames = 100
+    for i, batch in enumerate(loader):
+        if i < n_frames:
+            continue
+        if i >= n_frames + eval_frames:
+            break
+            
+        x = batch[0].to(device)
+        y = batch[2].to(device).view(-1)
+        if x.shape[1] == 0:
+            continue
+
+        enc, _, _ = model.encode(x)
+        valid = torch.any(
+            x.permute(0, 2, 3, 1).contiguous().reshape(-1, x.shape[1]) != 0, dim=1)
+        if not valid.any():
+            continue
+
+        h = F.normalize(enc[valid], dim=1).to(model.classify.weight.dtype)
+        protos = F.normalize(model.classify.weight, dim=1)
+        sims = h @ protos.T
+        preds = sims.argmax(dim=1)
+        labels = y[valid]
+        
+        hist += fast_hist(preds, labels, NUM_CLASSES)
+        
+    final_miou = calculate_iou(hist)
+
     return {"firing": firing, "precision": precision,
-            "setsize": setsize, "threshold": thresh_hist}
+            "setsize": setsize, "threshold": thresh_hist, "final_miou": final_miou}
 
 
 def main():
@@ -201,11 +252,12 @@ def main():
             if x.shape[1] == 0:
                 continue
             enc, _, _ = model.encode(x)
-        valid = torch.any(
-            x.permute(0, 2, 3, 1).contiguous().reshape(-1, x.shape[1]) != 0, dim=1)
-        h = F.normalize(enc[valid], dim=1).to(model.classify.weight.dtype)
-        sims = h @ F.normalize(model.classify.weight, dim=1).T
-        src_scores.append(sims.max(dim=1).values.cpu())
+            valid = torch.any(
+                x.permute(0, 2, 3, 1).contiguous().reshape(-1, x.shape[1]) != 0, dim=1)
+            h = F.normalize(enc[valid], dim=1).to(model.classify.weight.dtype)
+            sims = h @ F.normalize(model.classify.weight, dim=1).T
+            src_scores.append(sims.max(dim=1).values.cpu())
+            
     src_scores = torch.cat(src_scores)
     Q_STATIC = torch.quantile(src_scores.float(), 1.0 - TARGET_COVERAGE).item()
     print(f"  static threshold (source {int(TARGET_COVERAGE*100)}% coverage) = "
@@ -214,6 +266,9 @@ def main():
           f"median={src_scores.median():.3f} max={src_scores.max():.3f}")
 
     results = {}
+    import warnings
+    warnings.filterwarnings('ignore', r'Mean of empty slice')
+    
     for corr in CORRUPTIONS:
         for sev in SEVERITIES:
             root = os.path.join(KITTIC_DIR, corr, sev)
@@ -241,7 +296,7 @@ def main():
             key = f"{corr}/{sev}"
             results[key] = {}
             print(f"\n=== {key} ===")
-            print(f"{'arm':>12} {'fire%':>8} {'prec%':>8} {'|C|':>6} {'q_end':>8}")
+            print(f"{'arm':>12} {'fire%':>8} {'prec%':>8} {'|C|':>6} {'q_end':>8} {'mIoU':>8}")
 
             arms = {
                 "frozen":      None,
@@ -258,7 +313,8 @@ def main():
                 pr = np.nanmean(tr["precision"]) * 100
                 ss = np.nanmean(tr["setsize"])
                 qe = tr["threshold"][-1] if tr["threshold"] else float("nan")
-                print(f"{arm:>12} {f:>8.1f} {pr:>8.1f} {ss:>6.2f} {qe:>8.3f}")
+                mi = tr["final_miou"]
+                print(f"{arm:>12} {f:>8.1f} {pr:>8.1f} {ss:>6.2f} {qe:>8.3f} {mi:>8.1f}")
 
                 # THE HEADLINE CHECK, printed inline so it cannot be missed
                 if arm == "static":
@@ -270,43 +326,6 @@ def main():
     with open(OUT, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nsaved -> {OUT}")
-
-    print("""
-================================================================================
-HOW TO READ THIS -- and what each outcome means for the paper
-================================================================================
-1. static firing rate << 50% (the requested coverage), and FALLING with severity
-   -> THE CLAIM IS CONFIRMED. Static conformal calibration is vacuous under shift.
-      This is the refutation of ConformalHDC-for-TTA, and it is your premise.
-      The severity axis is the key evidence: firing should fall monotonically
-      light -> moderate -> heavy.
-
-2. static firing rate ~= 50% and stable
-   -> THE CLAIM IS FALSE. The shift does not move the score distribution enough to
-      decalibrate a static threshold, and the paper has no premise. STOP and rethink
-      before writing anything.
-
-3. aci_setsize holds its firing rate AND its precision where static collapses
-   -> the label-free mechanism works. This is the contribution.
-
-4. aci_setsize ~= aci_oracle
-   -> the set-size surrogate is as good as true-miscoverage feedback. This is the
-      strongest possible result: you recovered ACI's behaviour WITHOUT labels.
-
-5. aci_setsize ~= quantile
-   -> the ACI machinery buys nothing over a per-frame quantile. Then the honest paper
-      is "per-frame quantile calibration", which is simpler and still correct -- but
-      you must NOT dress it up as ACI. Say what it is.
-
-6. ungated collapses (low precision, mIoU tanks)
-   -> confirms that gating is load-bearing at all, which the earlier TTA disaster
-      already suggested.
-
-NOTE ON aci_oracle: it uses ground-truth labels. It is a CEILING, not a method.
-Never report it as deployable. It is in the table only to show what the label-free
-surrogate is chasing.
-""")
-
 
 if __name__ == "__main__":
     main()
