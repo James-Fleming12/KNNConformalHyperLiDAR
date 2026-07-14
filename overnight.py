@@ -112,6 +112,8 @@ SEEDS = [0, 1, 2]
 LRS = [0.0001, 0.001, 0.01, 0.1]
 COVERAGES = [0.05, 0.10, 0.25, 0.50]
 N_FRAMES = 2000
+CALIB_N = 200
+CALIB_MIN_N = 200
 
 if args.dry_run:
     print(">>> DRY RUN MODE ACTIVATED: Testing pipeline with 20 frames... <<<")
@@ -119,6 +121,8 @@ if args.dry_run:
     LRS = [0.01]
     COVERAGES = [0.50]
     N_FRAMES = 20
+    CALIB_N = 5
+    CALIB_MIN_N = 1
     GENERALIZE = ["snow/heavy"]
 
 OUT = "overnight.json"
@@ -157,7 +161,7 @@ def encode_frame(model, x, y):
 
 
 @torch.no_grad()
-def calibrate(model, loader, device, coverage, mondrian, n=200, min_n=200):
+def calibrate(model, loader, device, coverage, mondrian, n=None, min_n=None):
     """Thresholds from CLEAN SOURCE.
 
     min_n=200 (not 5): a 90th-percentile estimate from a handful of samples is
@@ -167,6 +171,9 @@ def calibrate(model, loader, device, coverage, mondrian, n=200, min_n=200):
     Classes below min_n fall back to the global q AND ARE REPORTED, because if half the
     live classes fall back, you are not actually running Mondrian.
     """
+    n = n if n is not None else CALIB_N
+    min_n = min_n if min_n is not None else CALIB_MIN_N
+    
     per, allsc = {c: [] for c in range(NUM_CLASSES)}, []
     for i, b in enumerate(loader):
         if i >= n:
@@ -324,7 +331,9 @@ def supervised_ceiling(model, loader, device, src, live, n_frames=N_FRAMES):
     acc = torch.zeros_like(src)
     cnt = torch.zeros(NUM_CLASSES, device=device)
     for i, b in enumerate(loader):
-        if i >= n_frames or i % 2 == 1:
+        if i >= n_frames:
+            break
+        if i % 2 == 1:
             continue
         x, y = b[0].to(device), b[2].to(device).view(-1)
         if x.shape[1] == 0:
@@ -348,7 +357,9 @@ def supervised_ceiling(model, loader, device, src, live, n_frames=N_FRAMES):
 
     hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=device)
     for i, b in enumerate(loader):
-        if i >= n_frames or i % 2 == 0:
+        if i >= n_frames:
+            break
+        if i % 2 == 0:
             continue
         x, y = b[0].to(device), b[2].to(device).view(-1)
         if x.shape[1] == 0:
@@ -424,10 +435,13 @@ def main():
                               seed=s)["miou"] for s in SEEDS]
     # frozen is deterministic, so instead measure window-to-window variation
     win = []
+    window_size = 400 if not args.dry_run else 5
     for w in range(4):
         hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=dev)
         for i, b in enumerate(loader):
-            if i < w * 400 or i >= (w + 1) * 400:
+            if i >= (w + 1) * window_size:
+                break
+            if i < w * window_size:
                 continue
             x, y = b[0].to(dev), b[2].to(dev).view(-1)
             if x.shape[1] == 0:
