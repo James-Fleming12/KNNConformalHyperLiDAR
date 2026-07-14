@@ -112,7 +112,7 @@ def collect_source(model, loader, device, cap):
         if x.shape[1] == 0:
             continue
         enc, idx, _ = model.encode(x)
-        h = F.normalize(enc)
+        h = F.normalize(enc, dim=1)
         lab = y[idx] if idx is not None else y
         v = (lab >= 0) & (lab < model.num_classes)
         if not v.any():
@@ -134,14 +134,14 @@ def collect_source(model, loader, device, cap):
 def collect_target(model, loader, device, cap):
     """Returns H, preds, correct, and the top-2 prototype sims (for the margin arm)."""
     H, P, C, M = [], [], [], []
-    protos = F.normalize(model.classify.weight)
+    protos = F.normalize(model.classify.weight, dim=1)
     counts = {c: 0 for c in range(model.num_classes)}
     for batch in loader:
         x = batch[0].to(device); y = batch[2].to(device).view(-1)
         if x.shape[1] == 0:
             continue
         enc, idx, _ = model.encode(x)
-        h = F.normalize(enc)
+        h = F.normalize(enc, dim=1)
         lab = y[idx] if idx is not None else y
         v = (lab >= 0) & (lab < model.num_classes)
         if not v.any():
@@ -252,7 +252,7 @@ def main():
     print("\n" + "=" * 76)
     print("BASELINE ARMS")
     print("=" * 76)
-    protos = F.normalize(model.classify.weight).detach()
+    protos = F.normalize(model.classify.weight, dim=1).detach()
     for arm in ("ball", "prototype", "margin"):
         row = {}
         for cond, (H, P, C, M) in tgt.items():

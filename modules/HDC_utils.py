@@ -200,18 +200,18 @@ class Model(nn.Module):
         # Compute the cosine distance between normalized hypervectors
         if enc.dtype != self.classify.weight.dtype:
             self.classify = self.classify.to(enc.dtype)
-        logits = self.classify(F.normalize(enc))
+        logits = self.classify(F.normalize(enc, dim=1))
 
         #logits = torch.div(logits, self.temperature)
         #softmax_logits = F.log_softmax(logits, dim=1)
 
-        return logits, F.normalize(enc), indices, is_wrong_left # enc is still hd_dim, but some elements are 0
+        return logits, F.normalize(enc, dim=1), indices, is_wrong_left # enc is still hd_dim, but some elements are 0
 
     def get_predictions(self, enc):
         # Compute the cosine distance between normalized hypervectors
         if enc.dtype != self.classify.weight.dtype:
             self.classify = self.classify.to(enc.dtype)
-        logits = self.classify(F.normalize(enc))
+        logits = self.classify(F.normalize(enc, dim=1))
         return logits
 
     def extract_class_hv(self, mask=None):
@@ -438,14 +438,14 @@ class KNNModel(nn.Module):
         enc, indices, is_wrong_left = self.encode(x, mask, PERCENTAGE, is_wrong)
         if enc.dtype != self.classify.weight.dtype:
             self.classify = self.classify.to(enc.dtype)
-        logits = self.classify(F.normalize(enc))
+        logits = self.classify(F.normalize(enc, dim=1))
 
-        return logits, F.normalize(enc), indices, is_wrong_left
+        return logits, F.normalize(enc, dim=1), indices, is_wrong_left
 
     def get_predictions(self, enc):
         if enc.dtype != self.classify.weight.dtype:
             self.classify = self.classify.to(enc.dtype)
-        logits = self.classify(F.normalize(enc))
+        logits = self.classify(F.normalize(enc, dim=1))
         return logits
 
     def extract_class_hv(self, mask=None):
@@ -483,7 +483,7 @@ class KNNModel(nn.Module):
         if preds is None:
             preds = self.get_predictions(enc).argmax(dim=1)
             
-        enc = F.normalize(enc)
+        enc = F.normalize(enc, dim=1)
         # We want higher confidence to be better. So we compute - (d_in / d_out)
         # Initialize with -6e4 (a low valid float16 confidence)
         confidence = torch.full((enc.shape[0],), -6e4, device=self.device, dtype=enc.dtype)
@@ -527,7 +527,7 @@ class KNNModel(nn.Module):
         Add newly admitted, highly confident samples to the k-NN bank.
         Uses a FIFO queue to enforce `self.bank_size`.
         """
-        enc = F.normalize(enc)
+        enc = F.normalize(enc, dim=1)
         for c in labels.unique().tolist():
             m = labels == c
             new_samples = enc[m]
@@ -563,7 +563,7 @@ class KNNModel(nn.Module):
             return torch.zeros(num_total_samples, device=self.device, dtype=torch.long)
         
         active_enc = enc[valid_enc_mask]
-        enc_norm = F.normalize(active_enc)
+        enc_norm = F.normalize(active_enc, dim=1)
         
         if enc_norm.dtype != self.classify.weight.dtype:
             enc_norm = enc_norm.to(self.classify.weight.dtype)
@@ -618,6 +618,47 @@ class KNNModel(nn.Module):
         return full_predictions
 
     @torch.no_grad()
+    def calibrate_thresholds(self, coverage=0.50):
+        """
+        Calibrates the thresholds for both prototype and k-NN gating using the 
+        clean source data already stored in self.bank.
+        """
+        if not hasattr(self, 'bank') or not self.bank:
+            self.knn_threshold = -1.2
+            self.prototype_threshold = 0.45
+            return
+            
+        knn_scores = []
+        proto_scores = []
+        normalized_prototypes = F.normalize(self.classify.weight, dim=1)
+        
+        for c, hvs in self.bank.items():
+            if hvs.shape[0] == 0: continue
+            take = min(hvs.shape[0], 1000)
+            hvs_sub = hvs[:take]
+            
+            # Prototype similarities (higher = better)
+            sims = F.linear(hvs_sub, normalized_prototypes[c:c+1])
+            proto_scores.append(sims.squeeze(1))
+            
+            # k-NN confidences (higher = better)
+            preds = torch.full((take,), c, dtype=torch.long, device=self.device)
+            conf = self.get_confidence(hvs_sub, preds)
+            knn_scores.append(conf)
+            
+        if not proto_scores:
+            self.knn_threshold = -1.2
+            self.prototype_threshold = 0.45
+            return
+            
+        proto_scores = torch.cat(proto_scores)
+        knn_scores = torch.cat(knn_scores)
+        
+        # Take the (1 - coverage) quantile for 'higher is better' scores
+        self.prototype_threshold = torch.quantile(proto_scores.float(), 1.0 - coverage).item()
+        self.knn_threshold = torch.quantile(knn_scores.float(), 1.0 - coverage).item()
+
+    @torch.no_grad()
     def prototype_update(self, x, learning_rate=0.01, threshold=0.45):
         """
         Baseline prototype gating: updates the class prototypes using EMA, 
@@ -633,12 +674,12 @@ class KNNModel(nn.Module):
         if not torch.any(valid_enc_mask):
             return torch.zeros(num_total_samples, device=self.device, dtype=torch.long)
         
-        active_enc = F.normalize(enc[valid_enc_mask])
+        active_enc = F.normalize(enc[valid_enc_mask], dim=1)
         if active_enc.dtype != self.classify.weight.dtype:
             active_enc = active_enc.to(self.classify.weight.dtype)
 
         # Get logits using normalized enc against normalized prototypes
-        normalized_prototypes = F.normalize(self.classify.weight)
+        normalized_prototypes = F.normalize(self.classify.weight, dim=1)
         sims = F.linear(active_enc, normalized_prototypes)
         
         max_sims, predictions = sims.max(dim=1)
@@ -718,7 +759,7 @@ class EfficientKNNModel(KNNModel):
         if self.use_binary:
             x = torch.sign(x)
         else:
-            x = F.normalize(x)
+            x = F.normalize(x, dim=1)
         return x
 
     def _compute_distance(self, topk_sims, dim):

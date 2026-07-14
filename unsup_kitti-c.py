@@ -197,16 +197,44 @@ def evaluate_and_adapt(model, target_dataloader, device, eval_only=False, update
                         proj_xyz=proj_xyz
                     )
                 elif update_method == 'knn':
+                    thresh = getattr(model, 'knn_threshold', -1.2)
+                    
+                    # Print diagnostics on the first frame
+                    if not hasattr(model, '_printed_diagnostics'):
+                        model.eval()
+                        with torch.no_grad():
+                            enc, _, _ = model.encode(proj_in)
+                            valid = torch.any(proj_in.permute(0, 2, 3, 1).contiguous().reshape(-1, proj_in.shape[1]) != 0, dim=1)
+                            if torch.any(valid):
+                                enc_norm = F.normalize(enc[valid], dim=1).to(model.classify.weight.dtype)
+                                preds = model.classify(enc_norm).argmax(dim=1)
+                                conf = model.get_confidence(enc_norm, preds)
+                                ratios = -conf
+                                
+                                true_labels = proj_labels.view(-1)[valid]
+                                correct = (preds == true_labels)
+                                admitted = conf > thresh
+                                
+                                print("\n--- KNN Gate Diagnostics ---")
+                                print(f"Ratio (d_in/d_out) Range: min={ratios.min().item():.4f}, median={ratios.median().item():.4f}, max={ratios.max().item():.4f}")
+                                print(f"Threshold Set: {thresh:.4f} (Ratio threshold: {-thresh:.4f})")
+                                print(f"Firing Rate: {admitted.float().mean().item()*100:.1f}%")
+                                print(f"Frame Accuracy: {correct.float().mean().item()*100:.1f}%")
+                                if admitted.any():
+                                    print(f"Admitted Accuracy: {correct[admitted].float().mean().item()*100:.1f}%")
+                                print("----------------------------\n")
+                                model._printed_diagnostics = True
+
                     model.online_update(
                         proj_in,
                         learning_rate=0.01,
-                        threshold=-1.2 # Contrastive gate for k-NN
+                        threshold=thresh
                     )
                 elif update_method == 'prototype':
                     model.prototype_update(
                         proj_in,
                         learning_rate=0.01,
-                        threshold=0.45
+                        threshold=getattr(model, 'prototype_threshold', 0.45)
                     )
     
     avg_firing_rate = 0.0
@@ -297,6 +325,8 @@ def populate_knn_bank(model, data_dir, arch_cfg, data_cfg, device):
         print(f"Loading pre-populated k-NN bank from {bank_path}...")
         bank_data = torch.load(bank_path, map_location=device)
         model.bank = bank_data
+        print("Calibrating robust thresholds from source data...")
+        model.calibrate_thresholds(coverage=0.50)
         return
 
     print(f"Populating k-NN bank from {data_dir}...")
@@ -339,6 +369,9 @@ def populate_knn_bank(model, data_dir, arch_cfg, data_cfg, device):
                 if all(model.bank[c].shape[0] >= model.bank_size for c in range(model.num_classes)):
                     break
                     
+        print("Calibrating robust thresholds from source data...")
+        model.calibrate_thresholds(coverage=0.50)
+        
     print(f"Saving populated bank to {bank_path}...")
     torch.save(model.bank, bank_path)
 

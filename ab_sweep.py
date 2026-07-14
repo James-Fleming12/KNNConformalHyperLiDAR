@@ -47,7 +47,7 @@ def collect_source(model, loader, device, cap):
 def collect_target(model, loader, device, cap):
     H, P, C = [], [], []
     counts = {c: 0 for c in range(model.num_classes)}
-    protos = F.normalize(model.classify.weight)
+    protos = F.normalize(model.classify.weight, dim=1)
     for batch in loader:
         x = batch[0].to(device); y = batch[2].to(device).view(-1)
         if x.shape[1] == 0: continue
@@ -56,7 +56,7 @@ def collect_target(model, loader, device, cap):
         v = (lab >= 0) & (lab < model.num_classes)
         if not v.any(): continue
         enc, lab = enc[v], lab[v]
-        sims = F.normalize(enc).to(protos.dtype) @ protos.T
+        sims = F.normalize(enc, dim=1).to(protos.dtype) @ protos.T
         preds = sims.argmax(dim=1)
         for c in lab.unique().tolist():
             if counts[c] >= cap: continue
