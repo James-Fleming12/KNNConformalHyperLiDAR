@@ -517,7 +517,7 @@ class KNNModel(nn.Module):
             d_out = (1.0 - topk_out).clamp_min(0.0).mean(dim=1)
             
             # Ratio (lower ratio = more trustworthy) -> negate for confidence
-            confidence[m] = - (d_in / d_out.clamp_min(1e-4))
+            confidence[m] = (- (d_in / d_out.clamp_min(1e-4))).to(confidence.dtype)
             
         return confidence
 
