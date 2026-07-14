@@ -187,9 +187,13 @@ def run_supervised_ceiling(model, loader, device, src, live):
             cnt[c] += m.sum()
 
     new = src.clone()
+    PRIOR_N = 5000.0  # Acts as a prior of 5000 perfectly aligned points
     for c in range(NUM_CLASSES):
-        if cnt[c] > 100:
-            new[c] = F.normalize(acc[c].unsqueeze(0), dim=1).squeeze(0)
+        if cnt[c] > 0:
+            # acc[c] is the sum of target features (magnitude ~ cnt[c]).
+            # We shrink the new mean towards the original pretrained prototype (src[c]).
+            w_shrunk = (PRIOR_N * src[c] + acc[c])
+            new[c] = F.normalize(w_shrunk.unsqueeze(0), dim=1).squeeze(0)
     model.classify.weight.data = new
 
     hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=device)
