@@ -70,9 +70,9 @@ def encode_frame(model, x, y, device):
 
 
 @torch.no_grad()
-def calibrate(model, loader, device, coverage, mondrian, n=100):
+def calibrate(model, loader, device, coverage, mondrian, n=500):
     """Return threshold(s) on CLEAN SOURCE data.
-    Increased to 100 frames to give rare classes a better chance of non-empty calibration.
+    Increased to 500 frames and uses trainloader to get stable quantiles for rare classes.
     """
     scores = {c: [] for c in range(NUM_CLASSES)}
     allsc = []
@@ -99,20 +99,38 @@ def calibrate(model, loader, device, coverage, mondrian, n=100):
     # Mondrian: calibrate WITHIN each class
     qs = {}
     glob = torch.quantile(torch.cat(allsc).float(), 1.0 - coverage).item()
+    
+    sizes = {c: sum(t.numel() for t in scores[c]) if scores[c] else 0 for c in range(NUM_CLASSES)}
+    valid_qs = {}
+    
+    # Establish valid anchors
     for c in range(NUM_CLASSES):
-        if scores[c]:
+        if sizes[c] >= 200:
             v = torch.cat(scores[c]).float()
-            # lowered fallback threshold to 5 points since we know rare classes are critical
-            qs[c] = torch.quantile(v, 1.0 - coverage).item() if v.numel() >= 5 else glob
+            valid_qs[c] = torch.quantile(v, 1.0 - coverage).item()
+            
+    fallback_count = 0
+    for c in range(NUM_CLASSES):
+        if sizes[c] >= 200:
+            qs[c] = valid_qs[c]
         else:
-            qs[c] = glob
+            fallback_count += 1
+            if not valid_qs:
+                qs[c] = glob
+            else:
+                # Borrow threshold from nearest valid class size to prevent starvation fallback
+                nearest_c = min(valid_qs.keys(), key=lambda k: abs(sizes[k] - sizes[c]))
+                qs[c] = valid_qs[nearest_c]
+                
+    if fallback_count > 0:
+        print(f"      [Mondrian cov={coverage}] {fallback_count} classes fell back to nearest-size neighbor (<200 pts)")
     return qs
 
 
 @torch.no_grad()
 def run(model, loader, device, src_proto, qs, soft=False,
-        n_adapt=N_ADAPT, n_eval=N_EVAL):
-    """Adapt with the given per-class thresholds, then evaluate. Tracks per-class firing."""
+        n_adapt=N_ADAPT, n_eval=300, num_eval_windows=3):
+    """Adapt with the given per-class thresholds, then evaluate across multiple windows."""
     model.classify.weight.data = src_proto.clone()
     fire_n = torch.zeros(NUM_CLASSES, device=device)
     seen_n = torch.zeros(NUM_CLASSES, device=device)
@@ -148,6 +166,9 @@ def run(model, loader, device, src_proto, qs, soft=False,
         if admit.any():
             for c in preds[admit].unique().tolist():
                 m = (preds == c) & admit
+                # Noise limit: ignore updates from less than 10 points
+                if m.sum() < 10:
+                    continue
                 if soft:
                     w = (s[m] - qs[c]).clamp_min(0).unsqueeze(1)
                     pull = (h[m] * w).sum(0) / w.sum().clamp_min(1e-8)
@@ -156,12 +177,16 @@ def run(model, loader, device, src_proto, qs, soft=False,
                 nw = model.classify.weight[c] + LR * pull
                 model.classify.weight[c] = F.normalize(nw.unsqueeze(0), dim=1).squeeze(0)
 
-    # eval
-    hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=device)
+    # evaluate in multiple disjoint windows to capture variance
+    eval_hists = []
+    current_hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=device)
+    total_eval_frames = n_eval * num_eval_windows
+    frames_in_window = 0
+    
     for i, b in enumerate(loader):
         if i < n_adapt:
             continue
-        if i >= n_adapt + n_eval:
+        if i >= n_adapt + total_eval_frames:
             break
         x = b[0].to(device); y = b[2].to(device).view(-1)
         if x.shape[1] == 0:
@@ -170,23 +195,41 @@ def run(model, loader, device, src_proto, qs, soft=False,
         if out is None:
             continue
         _, _, preds, labels = out
-        hist += fast_hist(preds, labels, NUM_CLASSES)
+        current_hist += fast_hist(preds, labels, NUM_CLASSES)
+        frames_in_window += 1
+        
+        if frames_in_window >= n_eval:
+            eval_hists.append(current_hist.cpu())
+            current_hist = torch.zeros((NUM_CLASSES, NUM_CLASSES), device=device)
+            frames_in_window = 0
 
-    iou, seen = per_class_iou(hist)
+    if frames_in_window > 0:
+        eval_hists.append(current_hist.cpu())
+
     fr = (fire_n / seen_n.clamp_min(1)).cpu().numpy()
     pc = (prec_n / fire_n.clamp_min(1)).cpu().numpy()
     
-    return {"per_class_iou": (iou * 100).cpu().numpy(),
-            "seen": seen.cpu().numpy(), "fire_rate": fr, "precision": pc,
+    # Store all hists so main can compute mean/std across windows
+    return {"fire_rate": fr, "precision": pc,
             "n_seen": seen_n.cpu().numpy(), "gt_n_adapt": gt_n_adapt.cpu().numpy(),
-            "hist": hist.cpu().numpy()}
-
+            "eval_hists": eval_hists}
 
 def get_live_miou(run_dict, live_classes):
-    """Computes mIoU strictly over the live classes that the source model can actually predict."""
+    """Computes mean mIoU and std across multiple evaluation windows."""
     if not live_classes:
-        return 0.0
-    return np.nanmean([run_dict["per_class_iou"][c] for c in live_classes])
+        return 0.0, 0.0
+    window_mious = []
+    for hist in run_dict["eval_hists"]:
+        iou, seen = per_class_iou(hist)
+        miou = np.nanmean([iou[c].item()*100 for c in live_classes if seen[c]])
+        window_mious.append(miou)
+    return np.mean(window_mious), np.std(window_mious)
+
+def get_live_per_class_iou(run_dict):
+    """Computes the aggregate per-class IoU over all windows combined."""
+    total_hist = sum(run_dict["eval_hists"])
+    iou, seen = per_class_iou(total_hist)
+    return (iou * 100).cpu().numpy()
 
 
 def main():
@@ -240,17 +283,17 @@ def main():
         # 1. Establish live classes using frozen model
         print("Evaluating frozen baseline to determine live classes...")
         frozen = run(model, loader, device, src, {c: 9.9 for c in range(NUM_CLASSES)})
+        frozen_pc_iou = get_live_per_class_iou(frozen)
         
         # A class is 'live' if the frozen model achieves at least 1.0 IoU on it.
-        # This explicitly removes hallucinated classes (GT=0, Pred>0) and completely dead classes.
-        live_classes = [c for c in range(NUM_CLASSES) if frozen['per_class_iou'][c] >= 1.0]
-        frozen_live_miou = get_live_miou(frozen, live_classes)
+        live_classes = [c for c in range(NUM_CLASSES) if frozen_pc_iou[c] >= 1.0]
+        frozen_live_miou, frozen_live_std = get_live_miou(frozen, live_classes)
         print(f"Found {len(live_classes)} live classes: {live_classes}")
-        print(f"Frozen LIVE mIoU: {frozen_live_miou:.2f}")
+        print(f"Frozen LIVE mIoU: {frozen_live_miou:.2f} ± {frozen_live_std:.2f}")
 
         # ---- D3/D4: coverage operating point on LIVE CLASSES ------------------
         print(f"\nD3/D4: coverage sweep  (marginal = global q; mondrian = per-class q)")
-        print(f"{'cov':>6} {'marg mIoU':>10} {'mond mIoU':>10} {'mond-marg':>10} "
+        print(f"{'cov':>6} {'marg mIoU':>12} {'mond mIoU':>12} {'mond-marg':>10} "
               f"{'marg minfire':>13} {'mond minfire':>13}")
         for cov in COVERAGES:
             q_m = calibrate(model, src_loader, device, cov, mondrian=False)
@@ -258,18 +301,19 @@ def main():
             rm = run(model, loader, device, src, q_m)
             rc = run(model, loader, device, src, q_c)
             
-            rm_miou = get_live_miou(rm, live_classes)
-            rc_miou = get_live_miou(rc, live_classes)
+            rm_miou, rm_std = get_live_miou(rm, live_classes)
+            rc_miou, rc_std = get_live_miou(rc, live_classes)
             
             # minfire computed strictly over live classes
             seen_m = np.array([True if c in live_classes and rm["n_seen"][c] > 100 else False for c in range(NUM_CLASSES)])
             mn_m = rm["fire_rate"][seen_m].min() * 100 if seen_m.any() else float("nan")
             mn_c = rc["fire_rate"][seen_m].min() * 100 if seen_m.any() else float("nan")
             
-            print(f"{cov:>6.2f} {rm_miou:>10.2f} {rc_miou:>10.2f} "
+            print(f"{cov:>6.2f} {rm_miou:>5.2f}±{rm_std:>4.2f} {rc_miou:>5.2f}±{rc_std:>4.2f} "
                   f"{rc_miou-rm_miou:>+10.2f} {mn_m:>13.1f} {mn_c:>13.1f}")
             results[cond][f"cov{cov}"] = {
-                "marginal_miou_live": rm_miou, "mondrian_miou_live": rc_miou,
+                "marginal_miou_live": rm_miou, "marginal_std": rm_std,
+                "mondrian_miou_live": rc_miou, "mondrian_std": rc_std,
             }
 
         # ---- D1/D2: per-class starvation and IoU delta at 50% coverage ---------
@@ -277,6 +321,9 @@ def main():
         q_c = calibrate(model, src_loader, device, 0.50, mondrian=True)
         rm = run(model, loader, device, src, q_m)
         rc = run(model, loader, device, src, q_c)
+        
+        rm_pc_iou = get_live_per_class_iou(rm)
+        rc_pc_iou = get_live_per_class_iou(rc)
 
         print(f"\nD1/D2: PER-CLASS BREAKDOWN (Live Classes Only, 50% Coverage)")
         print(f"{'cls':>4} {'GT_pts':>9} {'Pred_pts':>9} {'fire_marg':>10} {'fire_mond':>10} "
@@ -289,19 +336,19 @@ def main():
             pred_pts = int(rm['n_seen'][c])
             fm = rm['fire_rate'][c]*100
             fc = rc['fire_rate'][c]*100
-            ifz = frozen['per_class_iou'][c]
-            im = rm['per_class_iou'][c]
-            ic = rc['per_class_iou'][c]
+            ifz = frozen_pc_iou[c]
+            im = rm_pc_iou[c]
+            ic = rc_pc_iou[c]
             delta = ic - im
             
             print(f"{c:>4} {gt_pts:>9} {pred_pts:>9} "
                   f"{fm:>9.1f}% {fc:>9.1f}% "
                   f"{ifz:>9.1f} {im:>9.1f} {ic:>9.1f} {delta:>+8.1f}")
                   
-        rm_miou = get_live_miou(rm, live_classes)
-        rc_miou = get_live_miou(rc, live_classes)
-        print(f"\n  LIVE mIoU:  frozen={frozen_live_miou:.2f}  "
-              f"marginal={rm_miou:.2f}  mondrian={rc_miou:.2f}  "
+        rm_miou, rm_std = get_live_miou(rm, live_classes)
+        rc_miou, rc_std = get_live_miou(rc, live_classes)
+        print(f"\n  LIVE mIoU:  frozen={frozen_live_miou:.2f}±{frozen_live_std:.2f}  "
+              f"marginal={rm_miou:.2f}±{rm_std:.2f}  mondrian={rc_miou:.2f}±{rc_std:.2f}  "
               f"(Delta: {rc_miou - rm_miou:+.2f})")
 
     with open(OUT, "w") as f:
