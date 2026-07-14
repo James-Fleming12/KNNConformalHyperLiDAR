@@ -638,7 +638,7 @@ class KNNModel(nn.Module):
             hvs_sub = hvs[:take].to(self.device)
             
             # Prototype similarities (higher = better)
-            sims = F.linear(hvs_sub, normalized_prototypes[c:c+1])
+            sims = F.linear(hvs_sub, normalized_prototypes[c:c+1].to(hvs_sub.dtype))
             proto_scores.append(sims.squeeze(1))
             
             # k-NN confidences (higher = better)
